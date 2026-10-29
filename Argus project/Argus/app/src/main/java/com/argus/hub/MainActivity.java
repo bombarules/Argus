@@ -3,6 +3,7 @@ package com.argus.hub;
 import android.app.Activity;
 import android.app.role.RoleManager;
 import android.content.Intent;
+import android.media.projection.MediaProjectionManager;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
@@ -29,6 +30,9 @@ public class MainActivity extends Activity {
 
     private WebView web;
     private static final int REQ_HOME_ROLE = 7;
+    private static final int REQ_PROJECTION = 42;
+    private String pendingCode;
+    private String pendingName;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -44,9 +48,41 @@ public class MainActivity extends Activity {
         settings.setMediaPlaybackRequiresUserGesture(false);
         web.setWebViewClient(new WebViewClient());
         web.addJavascriptInterface(new Bridge(), "BombaNative");
+        ShareService.sink = status -> {
+            if (web != null) {
+                final String js = "window.bombaShareStatus&&window.bombaShareStatus("
+                        + status.toString() + ")";
+                web.post(() -> web.evaluateJavascript(js, null));
+            }
+        };
         if (savedInstanceState == null) {
             web.loadUrl("file:///android_asset/index.html");
         }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_PROJECTION) return;
+        if (resultCode == RESULT_OK && data != null && pendingCode != null) {
+            Intent svc = new Intent(this, ShareService.class);
+            svc.putExtra(ShareService.EXTRA_RESULT_CODE, resultCode);
+            svc.putExtra(ShareService.EXTRA_RESULT_DATA, data);
+            svc.putExtra(ShareService.EXTRA_CODE, pendingCode);
+            svc.putExtra(ShareService.EXTRA_NAME, pendingName);
+            startForegroundService(svc);
+        } else {
+            try {
+                JSONObject s = new JSONObject();
+                s.put("state", "error");
+                s.put("message", "Sharing was cancelled");
+                ShareService.lastStatusJson = s.toString();
+                if (ShareService.sink != null) ShareService.sink.onShareStatus(s);
+            } catch (Exception ignored) {
+            }
+        }
+        pendingCode = null;
+        pendingName = null;
     }
 
     @Override
@@ -169,9 +205,25 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void startScreenShare(final String code, final String name) {
+            runOnUiThread(() -> {
+                pendingCode = code;
+                pendingName = name;
+                MediaProjectionManager mpm =
+                        (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+                startActivityForResult(mpm.createScreenCaptureIntent(), REQ_PROJECTION);
+            });
+        }
+
+        @JavascriptInterface
+        public void stopScreenShare() {
+            stopService(new Intent(MainActivity.this, ShareService.class));
+            ShareService.lastStatusJson = "{}";
+        }
+
+        @JavascriptInterface
         public String shareState() {
-            // Screen sharing is not part of this build; report "not sharing".
-            return "{}";
+            return ShareService.lastStatusJson;
         }
     }
 }
