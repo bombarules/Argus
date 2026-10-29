@@ -1,14 +1,34 @@
 package com.argus.hub;
 
 import android.app.Activity;
+import android.app.role.RoleManager;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.drawable.Drawable;
+import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
+import android.util.Base64;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
 public class MainActivity extends Activity {
 
     private WebView web;
+    private static final int REQ_HOME_ROLE = 7;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -23,8 +43,19 @@ public class MainActivity extends Activity {
         settings.setLoadWithOverviewMode(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         web.setWebViewClient(new WebViewClient());
+        web.addJavascriptInterface(new Bridge(), "BombaNative");
         if (savedInstanceState == null) {
             web.loadUrl("file:///android_asset/index.html");
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // Home button pressed while Argus is the home app: reset to the ball.
+        if (web != null) {
+            web.post(() -> web.evaluateJavascript("window.bombaHome&&window.bombaHome()", null));
         }
     }
 
@@ -34,6 +65,113 @@ public class MainActivity extends Activity {
             web.goBack();
         } else {
             super.onBackPressed();
+        }
+    }
+
+    private boolean isDefaultHome() {
+        Intent home = new Intent(Intent.ACTION_MAIN);
+        home.addCategory(Intent.CATEGORY_HOME);
+        ResolveInfo info = getPackageManager().resolveActivity(home, PackageManager.MATCH_DEFAULT_ONLY);
+        return info != null && info.activityInfo != null
+                && getPackageName().equals(info.activityInfo.packageName);
+    }
+
+    private void openHomeSwitch() {
+        // Not the home app yet: the system asks with its own dialog (Android 10+).
+        if (!isDefaultHome() && Build.VERSION.SDK_INT >= 29) {
+            RoleManager rm = (RoleManager) getSystemService(ROLE_SERVICE);
+            if (rm != null && rm.isRoleAvailable(RoleManager.ROLE_HOME)
+                    && !rm.isRoleHeld(RoleManager.ROLE_HOME)) {
+                startActivityForResult(rm.createRequestRoleIntent(RoleManager.ROLE_HOME), REQ_HOME_ROLE);
+                return;
+            }
+        }
+        // Already home (switch back) or older Android: system home settings list.
+        try {
+            startActivity(new Intent(Settings.ACTION_HOME_SETTINGS));
+        } catch (Exception e) {
+            startActivity(new Intent(Settings.ACTION_SETTINGS));
+        }
+    }
+
+    /** Bridge the page's existing UI expects, under its original name. */
+    public class Bridge {
+
+        @JavascriptInterface
+        public void requestApps() {
+            new Thread(() -> {
+                JSONArray arr = new JSONArray();
+                try {
+                    PackageManager pm = getPackageManager();
+                    Intent main = new Intent(Intent.ACTION_MAIN);
+                    main.addCategory(Intent.CATEGORY_LAUNCHER);
+                    List<ResolveInfo> apps = pm.queryIntentActivities(main, 0);
+                    List<ResolveInfo> sorted = new ArrayList<>(apps);
+                    Collections.sort(sorted, new ResolveInfo.DisplayNameComparator(pm));
+                    for (ResolveInfo ri : sorted) {
+                        JSONObject o = new JSONObject();
+                        o.put("label", String.valueOf(ri.loadLabel(pm)));
+                        o.put("pkg", ri.activityInfo.packageName);
+                        o.put("icon", iconDataUri(pm, ri));
+                        arr.put(o);
+                    }
+                } catch (Exception ignored) {
+                }
+                final String js = "window.bombaApps&&window.bombaApps(" + arr.toString() + ")";
+                web.post(() -> web.evaluateJavascript(js, null));
+            }).start();
+        }
+
+        private String iconDataUri(PackageManager pm, ResolveInfo ri) {
+            try {
+                Drawable d = ri.loadIcon(pm);
+                int size = 96;
+                Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+                Canvas canvas = new Canvas(bmp);
+                d.setBounds(0, 0, size, size);
+                d.draw(canvas);
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                bmp.compress(Bitmap.CompressFormat.PNG, 100, out);
+                return "data:image/png;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP);
+            } catch (Exception e) {
+                return "";
+            }
+        }
+
+        @JavascriptInterface
+        public void launch(final String pkg) {
+            runOnUiThread(() -> {
+                try {
+                    Intent i = getPackageManager().getLaunchIntentForPackage(pkg);
+                    if (i != null) {
+                        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(i);
+                    }
+                } catch (Exception ignored) {
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void pickWallpaper() {
+            runOnUiThread(() -> {
+                try {
+                    Intent i = new Intent(Intent.ACTION_SET_WALLPAPER);
+                    startActivity(Intent.createChooser(i, "Wallpaper"));
+                } catch (Exception ignored) {
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void homeSettings() {
+            runOnUiThread(MainActivity.this::openHomeSwitch);
+        }
+
+        @JavascriptInterface
+        public String shareState() {
+            // Screen sharing is not part of this build; report "not sharing".
+            return "{}";
         }
     }
 }
